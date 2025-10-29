@@ -38,12 +38,10 @@ Examples:
 
 """
 
-import sys
 import math
 import re
 import os
 import argparse
-from datetime import datetime
 
 # Sequences based on user preferences from AllMoves file
 HOMING_SEQUENCE = """
