@@ -451,6 +451,8 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
                 if accumulated_length > distance_threshold:
                     # Different behavior for aggressive vs normal mode
                     is_clean_transition = False
+                    # Ensure force_pickup is always defined regardless of branch
+                    force_pickup = False
                     
                     if aggressive:
                         # In aggressive mode: ANY G0/G1 command can be a pickup point once we exceed the threshold
