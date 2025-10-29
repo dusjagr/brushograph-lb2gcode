@@ -132,9 +132,13 @@ INDEX_HTML = """
             </label>
             <label class="row"><input type="checkbox" name="aggressive" /> Aggressive mode</label>
             <label class="row"><input type="checkbox" name="debug" /> Debug output (server logs)</label>
+            <label class="row"><input type="checkbox" id="showlog" /> Show log on page</label>
           </fieldset>
         </div>
-        <button class="submit" type="submit" title="Optimize and download"> Optimize G-code</button>
+        <div style="display:flex; gap:.75rem; align-items:center; padding: 0 1.25rem 1.25rem;">
+          <button class="submit" type="submit" title="Optimize and download"> Optimize G-code</button>
+          <button class="submit" type="submit" formaction="/optimize_preview" title="Show log and download"> Preview with log</button>
+        </div>
       </form>
       <div class="footer">
         <span>Files processed ephemerally, not stored.</span>
@@ -153,6 +157,16 @@ INDEX_HTML = """
           const next = (root.getAttribute('data-theme') === 'dark') ? 'light' : 'dark';
           apply(next);
           localStorage.setItem(key, next);
+        });
+        // Route form to preview endpoint if Show log is checked
+        const form = document.getElementById('form');
+        form?.addEventListener('submit', (e) => {
+          const showlog = document.getElementById('showlog');
+          if (showlog && showlog.checked) {
+            form.action = '/optimize_preview';
+          } else {
+            form.action = '/optimize';
+          }
         });
       })();
     </script>
@@ -215,6 +229,86 @@ async def optimize(
         )
     except Exception as e:
         # In case of error, cleanup and return message
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return PlainTextResponse(f"Optimization failed: {e}", status_code=500)
+
+# Preview endpoint: returns HTML with log output and a data-URL download link
+@app.post("/optimize_preview")
+async def optimize_preview(
+    file: UploadFile = File(...),
+    distance: float = Form(100.0),
+    force_multiplier: float = Form(2.0),
+    aggressive: Optional[bool] = Form(False),
+    debug: Optional[bool] = Form(False),
+):
+    import io, base64, contextlib
+    original_name = file.filename or f"upload_{uuid.uuid4().hex}.gcode"
+    if not original_name.lower().endswith(".gcode"):
+        return PlainTextResponse("Please upload a .gcode file.", status_code=400)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="gcode_opt_"))
+    in_path = tmp_dir / original_name
+    out_name = original_name.rsplit(".gcode", 1)[0] + "_optimized.gcode"
+    out_path = tmp_dir / out_name
+
+    try:
+        with in_path.open("wb") as f_out:
+            shutil.copyfileobj(file.file, f_out)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            optimize_gcode(
+                str(in_path),
+                str(out_path),
+                float(distance),
+                float(force_multiplier),
+                bool(debug),
+                bool(aggressive),
+            )
+        log_text = buf.getvalue()
+
+        # Read optimized content and embed as base64 data URL
+        optimized_text = out_path.read_text(encoding="utf-8", errors="ignore")
+        b64 = base64.b64encode(optimized_text.encode("utf-8")).decode("ascii")
+        data_url = f"data:text/plain;base64,{b64}"
+
+        # Cleanup temp dir now that content is embedded
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        html = f"""
+<!doctype html>
+<html lang=\"en\" data-theme=\"dark\">
+  <head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+    <title>Optimization Result</title>
+    <style>
+      body {{ margin:0; font-family: ui-sans-serif, system-ui; background:#0b0f19; color:#e5e7eb; padding:1rem; }}
+      .wrap {{ max-width: 1000px; margin: 0 auto; }}
+      .top {{ display:flex; justify-content: space-between; align-items: center; gap: .8rem; }}
+      a.btn {{ display:inline-block; padding:.6rem .9rem; border-radius:10px; background: linear-gradient(135deg,#ff2dac,#29e0ff); color:#0b1220; font-weight:800; text-decoration:none; box-shadow: 0 0 20px rgba(255,45,172,.25), 0 0 20px rgba(41,224,255,.25); }}
+      pre {{ white-space: pre-wrap; background:#0a0f1a; border:1px solid #1f2a44; padding:1rem; border-radius:12px; overflow:auto; }}
+      .meta {{ color:#94a3b8; margin:.6rem 0 1rem; }}
+    </style>
+  </head>
+  <body>
+    <div class=\"wrap\">
+      <div class=\"top\">
+        <h2 style=\"margin:.2rem 0;\">Optimization complete</h2>
+        <a class=\"btn\" href=\"{data_url}\" download=\"{out_name}\">Download optimized G-code</a>
+      </div>
+      <div class=\"meta\">Source: {original_name} • Distance: {distance} • Force: {force_multiplier} • Aggressive: {bool(aggressive)}</div>
+      <pre>{log_text}</pre>
+      <p class=\"meta\"><a href=\"/\" style=\"color:#29e0ff\">← Back</a></p>
+    </div>
+  </body>
+</html>
+"""
+        return HTMLResponse(html)
+    except Exception as e:
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
