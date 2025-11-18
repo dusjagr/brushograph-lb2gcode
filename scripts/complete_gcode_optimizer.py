@@ -38,10 +38,12 @@ Examples:
 
 """
 
+import sys
 import math
 import re
 import os
 import argparse
+from datetime import datetime
 
 # Sequences based on user preferences from AllMoves file
 HOMING_SEQUENCE = """
@@ -53,10 +55,10 @@ G1 F1200;           ; Set feed rate to 1000
 """
 
 COLOR1_SEQUENCE = """
-; Color 1 picking sequence
-G1 Z10 F500;         ; Raise brush to safe height
+; Color picking sequence
+G1 Z10 F1000;         ; Raise brush to safe height
 G0 X41 Y5 F1200;    ; Rapid move to color 1 position
-G1 Z0 F500;         ; Lower into color - controlled movement
+G1 Z0 F1000;         ; Lower into color - controlled movement
 G1 X40.102Y7.295Z0S800F1200
 G1 X40.026Y7.642Z0F1200
 G1 X40Y8Z0F1200
@@ -123,7 +125,7 @@ G1 X40.393Y6.638Z0F1200
 G1 X40.225Y6.959Z0F1200
 G1 Z7 F800;         ; Raise from color - controlled movement
 G1 X34 Y8 Z1 F1200;     ; Movement in paint - controlled movement
-G1 X24 Y12 Z8 F500;     ; Move in paint - controlled movement
+G1 X24 Y18 Z8 F500;     ; Move in paint - controlled movement
 G1 F1200;           ; Set feed rate to 1000
 """
 
@@ -156,16 +158,8 @@ def _offset_x_in_gcode_block(block: str, dx: float) -> str:
 
 COLOR2_SEQUENCE = _offset_x_in_gcode_block(COLOR1_SEQUENCE, 45)
 
-COLOR3_SEQUENCE = """
-; Color 3 picking sequence, minimal cos it's at the edge
-G1 Z10 F500;         ; Raise brush to safe height
-G0 X124 Y12 F1200;    ; Rapid move to color 1 position
-G1 Z0 F500;         ; Lower into color - controlled movement
-G1 Z7 F800;         ; Raise from color - controlled movement
-G1 X119 Y12 Z1 F1200;     ; Movement in paint - controlled movement
-G1 X114 Y15 Z8 F500;     ; Move in paint - controlled movement
-G1 F1200;           ; Set feed rate to 1000
-"""
+COLOR3_SEQUENCE = _offset_x_in_gcode_block(COLOR1_SEQUENCE, 90)
+
 
 WASHING_SEQUENCE = """
 ; Washing sequence (no color)
@@ -199,7 +193,7 @@ G1 X15 Y12 Z8 F1200;     ; Rapid move to brush cleaning position
 G1 Z-1 F800;         ; Lower brush for cleaning - controlled movement
 G1 X25 Y14 Z6 F800;     ; Move across cleaning area - controlled movement
 G1 Z10 F800;         ; Maintain brush height - controlled movement
-G0 X20 Y110 Z10 F500;; Move to parking position with Z at safe height
+G0 X20 Y130 Z10 F500;; Move to parking position with Z at safe height
 M2;                 ; End program
 """
 
@@ -210,6 +204,9 @@ LAYER_COLOR_MAP = {
     "Red": {"sequence": COLOR3_SEQUENCE, "name": "Color 3"},
     "C03": {"sequence": COLOR3_SEQUENCE, "name": "Color 3"},
     "C00": {"sequence": COLOR1_SEQUENCE, "name": "Color 1"},
+    "C1": {"sequence": COLOR1_SEQUENCE, "name": "Color 1"},
+    "C2": {"sequence": COLOR2_SEQUENCE, "name": "Color 2"},
+    "C3": {"sequence": COLOR3_SEQUENCE, "name": "Color 3"},
     "Wash": {"sequence": WASHING_SEQUENCE, "name": "Washing"},
     "default": {"sequence": WASHING_SEQUENCE, "name": "Washing"}
 }
@@ -286,6 +283,8 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
     path_regex = re.compile(r'; Path\s+(\d+)')
     plunge_regex = re.compile(r'Z0F')
     retract_regex = re.compile(r'Z[2-9]F')
+    # Header like ';Cut @ 1200 mm/min, 90% power' (case-insensitive)
+    cut_header_regex = re.compile(r';\s*Cut\s*@\s*(\d+)\s*mm/min', re.IGNORECASE)
     
     # Start building the output file
     output_lines = []
@@ -297,12 +296,42 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
     line_index = 0
     processed_count = 0
     found_m8 = False
+    # Track current cut feedrate from header lines (e.g., ';Cut @ 999 mm/min')
+    current_cut_feedrate = None
+    # Buffer for original input lines awaiting a potential upcoming 'Cut @' header
+    pending_original_lines = []
+
+    def flush_pending(buffer_feedrate=None):
+        nonlocal pending_original_lines, output_lines
+        if not pending_original_lines:
+            return
+        if buffer_feedrate is not None:
+            rep = str(buffer_feedrate)
+            for pl in pending_original_lines:
+                output_lines.append(re.sub(r'(?<=F)1800\b', rep, pl))
+        else:
+            output_lines.extend(pending_original_lines)
+        pending_original_lines = []
     
     while line_index < len(lines):
         line = lines[line_index]
+
+        # Update current cut feedrate if a header line is encountered
+        cut_match = cut_header_regex.search(line)
+        if cut_match:
+            # Header applies to subsequent lines. First flush buffered lines using the PREVIOUS feedrate,
+            # then update the active feedrate to the new parsed value.
+            flush_pending(current_cut_feedrate)
+            try:
+                parsed = int(cut_match.group(1))
+            except Exception:
+                parsed = None
+            current_cut_feedrate = parsed
         
         # Check for M8 command (marker for new section)
         if m8_regex.search(line):
+            # Before starting a new section, flush any pending lines using current feedrate (if any)
+            flush_pending(current_cut_feedrate)
             found_m8 = True
             output_lines.append(line)  # Add the M8 line
             line_index += 1
@@ -356,6 +385,8 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
         # Check for layer change (if not handled by M8)
         layer_match = layer_regex.search(line)
         if layer_match and not found_m8:
+            # New layer encountered outside an M8 block, flush any pending lines first
+            flush_pending(current_cut_feedrate)
             current_layer = layer_match.group(1)
             if current_layer != previous_layer and previous_layer is None:
                 layer_lengths[current_layer] = layer_lengths.get(current_layer, 0)
@@ -404,7 +435,8 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
             match = re.search(r'^G1 (X.*Y.* F1200)$', line)
             output_lines.append(f"G0 {match.group(1)}   ; Move to starting position\n")
         else:
-            output_lines.append(line)
+            # Buffer original input lines to allow retroactive replacement when a Cut header appears
+            pending_original_lines.append(line)
         
         # Check for path change
         path_match = path_regex.search(line)
@@ -449,7 +481,7 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
                 if accumulated_length > distance_threshold:
                     # Different behavior for aggressive vs normal mode
                     is_clean_transition = False
-                    # Ensure force_pickup is always defined regardless of branch
+                    # Ensure defined for both modes to avoid UnboundLocalError
                     force_pickup = False
                     
                     if aggressive:
@@ -514,6 +546,8 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
                     
                     # Only insert pickup if we're at a clean transition point
                     if is_clean_transition:
+                        # Make sure all original lines up to this point are written before inserting sequences
+                        flush_pending(current_cut_feedrate)
                         if current_layer in LAYER_COLOR_MAP:
                             current_color_name = LAYER_COLOR_MAP[current_layer]["name"]
                             current_color_sequence = LAYER_COLOR_MAP[current_layer]["sequence"]
@@ -521,7 +555,7 @@ def optimize_gcode(input_file, output_file=None, distance_threshold=100, force_m
                             current_color_name = LAYER_COLOR_MAP["default"]["name"]
                             current_color_sequence = LAYER_COLOR_MAP["default"]["sequence"]
                         
-                        # More detailed debug output
+                        # More detailed debug output>>>
                         if force_pickup and accumulated_length >= (force_multiplier * distance_threshold):
                             print(f"FORCING {current_color_name} pickup after {accumulated_length:.2f} mm (exceeded {force_multiplier*100}% threshold)")
                         else:
@@ -571,6 +605,9 @@ G1 Z{return_z} F1000;                       ; Lower Z to drawing position
         if debug and processed_count % 100 == 0:
             print(f"Processed {processed_count} lines so far, current path length: {total_length:.2f}mm")
     
+    # End of processing: flush any remaining buffered original lines
+    flush_pending(current_cut_feedrate)
+
     if debug:
         print(f"Finished processing {processed_count} lines out of {len(lines)}")
         print(f"Final path length: {total_length:.2f}mm")
