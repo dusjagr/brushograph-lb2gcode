@@ -3,11 +3,13 @@ import sys
 import uuid
 import shutil
 import tempfile
+import re
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 # Ensure we can import the optimizer from scripts/
@@ -16,12 +18,19 @@ REPO_ROOT = CURRENT_DIR.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+
 try:
     from complete_gcode_optimizer import optimize_gcode
 except Exception as e:
     # Provide a helpful error when import fails on the deployed service
     def optimize_gcode(*args, **kwargs):  # type: ignore
         raise RuntimeError("Failed to import optimizer. Ensure scripts/complete_gcode_optimizer.py exists.")
+
+try:
+    from raster_s_to_z import process_gcode as raster_process
+except Exception:
+    def raster_process(*args, **kwargs):  # type: ignore
+        raise RuntimeError("Failed to import raster tool. Ensure scripts/raster_s_to_z.py exists.")
 
 app = FastAPI(title="Brushograph G-code Optimizer API")
 
@@ -33,6 +42,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve static assets (e.g., logo.png) from repo img/ folder at /static
+app.mount("/static", StaticFiles(directory=str(REPO_ROOT / "img")), name="static")
 
 INDEX_HTML = """
 <!doctype html>
@@ -79,14 +91,15 @@ INDEX_HTML = """
         background: radial-gradient(1200px 800px at 5% -10%, var(--glow-b), transparent 60%),
                     radial-gradient(1200px 800px at 110% 10%, var(--glow-a), transparent 60%),
                     linear-gradient(180deg, var(--bg1), var(--bg2));
-        display: grid; place-items: center; padding: 2rem;
+        display: grid; place-items: start center; padding: calc(7.5rem + env(safe-area-inset-top, 0px)) 2rem 2rem;
       }
       .card { width: 100%; max-width: 960px; background: var(--card); border: 1px solid var(--outline); border-radius: 16px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,0.25); }
       .header { padding: 1.1rem 1.25rem; border-bottom: 1px solid var(--outline); display: flex; align-items: center; gap: .9rem; justify-content: space-between; }
       .brand { display:flex; align-items:center; gap:.9rem; }
-      .logo { width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #0b1220; font-weight: 900; box-shadow: 0 0 18px var(--glow-a), 0 0 18px var(--glow-b); }
+      .logo { width: 114px; height: 114px; border-radius: 12px; display: block; object-fit: cover; box-shadow: 0 0 18px var(--glow-a), 0 0 18px var(--glow-b); }
       h1 { margin: 0; font-size: 1.2rem; letter-spacing: .2px; }
       .sub { color: var(--muted); margin-top: .15rem; font-size: .95rem; }
+      .desc { color: var(--muted); margin-top: .35rem; font-size: .92rem; max-width: 46ch; }
       .theme-toggle { border: 1px solid var(--outline); background: transparent; color: var(--text); padding: .55rem .7rem; border-radius: 10px; cursor: pointer; }
       .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; padding: 1.1rem; }
       @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
@@ -106,10 +119,11 @@ INDEX_HTML = """
     <div class="card">
       <div class="header">
         <div class="brand">
-          <div class="logo">B</div>
+          <img class="logo" src="/static/logo.png" alt="Brushograph logo" />
           <div>
             <h1>Brushograph G-code Optimizer</h1>
-            <div class="sub">Upload .gcode → neon‑cleaned output with color sequences and safe moves.</div>
+            <div class="sub">Optimize vector G-code for painting and modify raster G-code Z moves.</div>
+            <div class="desc">Two tools in one: 1) Optimizer adds color pick-ups, washes, and safe moves. 2) Raster tool inserts Z lifts on S0 and drops on S-on, with optional feed override.</div>
           </div>
         </div>
         <button id="toggleTheme" class="theme-toggle" type="button" title="Toggle light/dark"> Toggle theme</button>
@@ -138,6 +152,35 @@ INDEX_HTML = """
         <div style="display:flex; gap:.75rem; align-items:center; padding: 0 1.25rem 1.25rem;">
           <button class="submit" type="submit" title="Optimize and download"> Optimize G-code</button>
           <button class="submit" type="submit" formaction="/optimize_preview" title="Show log and download"> Preview with log</button>
+        </div>
+      </form>
+      <form id="raster_form" method="post" action="/raster" enctype="multipart/form-data">
+        <div class="grid">
+          <fieldset>
+            <legend>Raster G-code</legend>
+            <label>G-code file (.gcode)
+              <input type="file" name="file" accept=".gcode" required />
+            </label>
+          </fieldset>
+          <fieldset>
+            <legend>Raster Options</legend>
+            <label>Z up (before S0)
+              <input type="number" step="0.1" name="z_up" value="5" />
+            </label>
+            <label>Z down (before S900)
+              <input type="number" step="0.1" name="z_down" value="0" />
+            </label>
+            <label>Z feed (mm/min)
+              <input type="number" step="1" name="z_feed" value="500" />
+            </label>
+            <label>Scan feed override (mm/min, optional)
+              <input type="number" step="1" name="scan_feed" placeholder="auto-detect if empty" />
+            </label>
+            <label class="row"><input type="checkbox" name="remove_s" /> Remove S commands</label>
+          </fieldset>
+        </div>
+        <div style="display:flex; gap:.75rem; align-items:center; padding: 0 1.25rem 1.25rem;">
+          <button class="submit" type="submit" title="Modify raster and download"> Modify raster G-code</button>
         </div>
       </form>
       <div class="footer">
@@ -314,6 +357,72 @@ async def optimize_preview(
         except Exception:
             pass
         return PlainTextResponse(f"Optimization failed: {e}", status_code=500)
+
+@app.post("/raster")
+async def raster(
+    file: UploadFile = File(...),
+    z_up: float = Form(5.0),
+    z_down: float = Form(0.0),
+    z_feed: float = Form(500.0),
+    scan_feed: Optional[str] = Form(None),
+    remove_s: Optional[bool] = Form(False),
+):
+    original_name = file.filename or f"upload_{uuid.uuid4().hex}.gcode"
+    if not original_name.lower().endswith(".gcode"):
+        return PlainTextResponse("Please upload a .gcode file.", status_code=400)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="gcode_raster_"))
+    in_path = tmp_dir / original_name
+    out_name = original_name.rsplit(".gcode", 1)[0] + "_raster.gcode"
+    out_path = tmp_dir / out_name
+
+    try:
+        with in_path.open("wb") as f_out:
+            shutil.copyfileobj(file.file, f_out)
+
+        # Read lines and optionally auto-detect scan feed from header comments
+        lines = in_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+        # Convert optional scan_feed string to float if provided, else None
+        sf: Optional[float] = None
+        if scan_feed is not None and str(scan_feed).strip() != "":
+            try:
+                sf = float(str(scan_feed).strip())
+            except ValueError:
+                sf = None
+        if sf is None:
+            for ln in lines[:50]:
+                m = re.search(r";\s*Scan\s*@\s*(\d+(?:\.\d+)?)\s*mm\s*/?\s*min", ln, flags=re.IGNORECASE)
+                if m:
+                    try:
+                        sf = float(m.group(1))
+                    except ValueError:
+                        sf = None
+                    break
+
+        result_lines = raster_process(
+            lines,
+            z_up=float(z_up),
+            z_down=float(z_down),
+            z_feed=float(z_feed),
+            use_g0=True,
+            keep_s=not bool(remove_s),
+            scan_feed=sf,
+        )
+
+        out_path.write_text("".join(result_lines), encoding="utf-8")
+
+        # Return file and clean up after response
+        return FileResponse(
+            path=str(out_path),
+            filename=out_name,
+            media_type="text/plain",
+        )
+    except Exception as e:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return PlainTextResponse(f"Raster modification failed: {e}", status_code=500)
 
 # Health check for Render
 @app.get("/healthz")
