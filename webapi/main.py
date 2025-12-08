@@ -131,7 +131,7 @@ INDEX_HTML = """
       <form id="form" method="post" action="/optimize" enctype="multipart/form-data">
         <div class="grid">
           <fieldset>
-            <legend>Upload</legend>
+            <legend>Colour pick-up G-code</legend>
             <label>G-code file (.gcode)
               <input type="file" name="file" accept=".gcode" required />
             </label>
@@ -361,9 +361,9 @@ async def optimize_preview(
 @app.post("/raster")
 async def raster(
     file: UploadFile = File(...),
-    z_up: float = Form(5.0),
-    z_down: float = Form(0.0),
-    z_feed: float = Form(500.0),
+    z_up: Optional[str] = Form("5.0"),
+    z_down: Optional[str] = Form("0.0"),
+    z_feed: Optional[str] = Form("500.0"),
     scan_feed: Optional[str] = Form(None),
     remove_s: Optional[bool] = Form(False),
 ):
@@ -382,11 +382,25 @@ async def raster(
 
         # Read lines and optionally auto-detect scan feed from header comments
         lines = in_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+        # Helper to parse floats allowing comma or dot
+        def _parse_float(val: Optional[str], default: float) -> float:
+            if val is None:
+                return default
+            s = str(val).strip().replace(",", ".")
+            try:
+                return float(s)
+            except ValueError:
+                return default
+
+        zu = _parse_float(z_up, 5.0)
+        zd = _parse_float(z_down, 0.0)
+        zf = _parse_float(z_feed, 500.0)
+
         # Convert optional scan_feed string to float if provided, else None
         sf: Optional[float] = None
         if scan_feed is not None and str(scan_feed).strip() != "":
             try:
-                sf = float(str(scan_feed).strip())
+                sf = float(str(scan_feed).strip().replace(",", "."))
             except ValueError:
                 sf = None
         if sf is None:
@@ -401,9 +415,9 @@ async def raster(
 
         result_lines = raster_process(
             lines,
-            z_up=float(z_up),
-            z_down=float(z_down),
-            z_feed=float(z_feed),
+            z_up=zu,
+            z_down=zd,
+            z_feed=zf,
             use_g0=True,
             keep_s=not bool(remove_s),
             scan_feed=sf,
