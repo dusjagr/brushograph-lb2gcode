@@ -23,17 +23,28 @@ def process_gcode(lines, z_up=5, z_down=0, z_feed=500, use_g0=True, keep_s=True,
         except ValueError:
             return None
 
+    # format with up to 3 decimals, trim trailing zeros
+    def _fmt(val):
+        try:
+            f = float(val)
+        except Exception:
+            return str(val)
+        s = f"{f:.3f}"
+        s = s.rstrip('0').rstrip('.')
+        return s if s else "0"
+
     def zcmd(value):
-        cmd = f"G0 Z{int(value)}"
+        cmd_g = "G0" if use_g0 else "G1"
+        cmd = f"{cmd_g} Z{_fmt(value)}"
         if z_feed:
-            cmd += f" F{int(z_feed)}"
+            cmd += f" F{_fmt(z_feed)}"
         return cmd
 
     def replace_feed(line):
         if scan_feed is None:
             return line
         # Replace any F<number> (with optional decimals and optional spaces) with F{scan_feed}
-        return re.sub(r"F\s*[-+]?\d+(?:\.\d+)?", f"F{int(scan_feed)}", line)
+        return re.sub(r"F\s*[-+]?\d+(?:\.\d+)?", lambda m: f"F{_fmt(scan_feed)}", line)
 
     for line in lines:
         lstripped = line.lstrip()
@@ -56,7 +67,7 @@ def process_gcode(lines, z_up=5, z_down=0, z_feed=500, use_g0=True, keep_s=True,
                 is_raised = True
         if in_scan_section and needs_down:
             if is_raised:
-                out.append(f"{zcmd(-int(z_up))}\n")  # drop by -z_up
+                out.append(f"{zcmd(-float(z_up))}\n")  # drop by -z_up
                 is_raised = False
 
         if keep_s:
